@@ -56,13 +56,13 @@ TIME_SLOTS = [
 ]
 BREAK_SLOTS = {"slot4"}
 
-DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 CAMERA_SOURCES = [
     {
         "id": "default",
-        "label": "Hikvision CCTV",
-        "source": "rtsp://admin:Thub%40project@192.168.11.9:554/Streaming/Channels/101"
+        "label": "Device Camera",
+        "source": 0          # built-in / USB webcam (index 0)
     },
 ]
 
@@ -79,6 +79,12 @@ attendance_today = {}
 
 face_app         = None
 known_embeddings = {}
+
+# ── Active automated sessions ─────────────────────────────────────────────────
+# key: session_id → {thread, stop_event, captures, detected_counts, start_time,
+#                    end_time, section, slot_id, dept, faculty, cam_id, date}
+active_sessions: dict = {}
+_session_lock = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -136,12 +142,43 @@ def setup_csv():
                  "Faculty", "Date", "Time", "Status"])
 
 def write_attendance_csv(roll, name, section, dept, slot_id, subject, faculty, status="Present"):
+    """Append one row to the CSV log. Duplicates are possible if the same session
+    is saved multiple times; use the JSON attendance_records as the authoritative
+    source of truth and treat the CSV as an audit trail only."""
     now = datetime.datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M:%S")
     with open(CSV_FILE, "a", newline="") as f:
         csv.writer(f).writerow(
             [roll, name, section, dept, slot_id, subject, faculty, date_str, time_str, status])
+
+def rewrite_attendance_csv_for_key(section, dept, slot_id, date_str, records, faculty):
+    """Rewrite ALL rows for a specific section+slot+date in the CSV to avoid duplicates.
+    Called by faculty_save_attendance and dept_update_attendance on every manual save."""
+    if not os.path.exists(CSV_FILE):
+        setup_csv()
+        return
+    # Read existing rows that are NOT for this key
+    kept_rows = []
+    with open(CSV_FILE, newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or ["Roll","Name","Section","Department","Slot","Subject","Faculty","Date","Time","Status"]
+        for row in reader:
+            if not (row.get("Section") == section and row.get("Slot") == slot_id and row.get("Date") == date_str):
+                kept_rows.append(row)
+    # Rewrite file with kept rows + fresh records for this key
+    time_str = datetime.datetime.now().strftime("%H:%M:%S")
+    with open(CSV_FILE, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(kept_rows)
+        for r in records:
+            w.writerow({
+                "Roll": r["roll"], "Name": r.get("name",""), "Section": section,
+                "Department": dept, "Slot": slot_id, "Subject": "",
+                "Faculty": faculty, "Date": date_str, "Time": time_str,
+                "Status": r.get("status","Absent"),
+            })
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SESSION / TIMETABLE HELPERS
@@ -156,19 +193,22 @@ def current_slot_id():
 def current_day() -> str:
     return datetime.datetime.now().strftime("%A")
 
-def generate_sessions_for_week(faculty_username: str, dept: str):
+def generate_sessions_for_week(faculty_username: str, dept: str, week_offset: int = 0):
     tt = db["timetable"].get(faculty_username, {})
     if not tt:
         return
     today = datetime.date.today()
-    monday = today - datetime.timedelta(days=today.weekday())
+    monday = today - datetime.timedelta(days=today.weekday()) + datetime.timedelta(weeks=week_offset)
     day_offsets = {d: i for i, d in enumerate(DAYS)}
 
-    existing_keys = set()
+    # Build index of existing sessions by composite key for fast lookup
+    existing_by_key = {}
     for s in db["sessions"]:
-        existing_keys.add(f"{s['faculty_username']}::{s['date']}::{s['slot_id']}::{s['section']}")
+        k = f"{s['faculty_username']}::{s['date']}::{s['slot_id']}::{s['section']}"
+        existing_by_key[k] = s
 
     new_sessions = []
+    changed = False
     for day_name, slots in tt.items():
         offset = day_offsets.get(day_name)
         if offset is None:
@@ -183,8 +223,26 @@ def generate_sessions_for_week(faculty_username: str, dept: str):
             if not section:
                 continue
             key = f"{faculty_username}::{date_str}::{slot_id}::{section}"
-            if key not in existing_keys:
-                slot_info = next((s for s in TIME_SLOTS if s["id"] == slot_id), {})
+            slot_info = next((s for s in TIME_SLOTS if s["id"] == slot_id), {})
+            if key in existing_by_key:
+                # Update mutable fields so dept_head edits always reflect
+                sess = existing_by_key[key]
+                updated = False
+                if sess.get("subject") != subject:
+                    sess["subject"] = subject; updated = True
+                if sess.get("dept") != dept:
+                    sess["dept"] = dept; updated = True
+                if sess.get("slot_start") != slot_info.get("start", ""):
+                    sess["slot_start"] = slot_info.get("start", ""); updated = True
+                if sess.get("slot_end") != slot_info.get("end", ""):
+                    sess["slot_end"] = slot_info.get("end", ""); updated = True
+                # Always keep att_key in sync with section+slot+date
+                expected_att_key = f"{section}::{slot_id}::{date_str}"
+                if sess.get("att_key") != expected_att_key:
+                    sess["att_key"] = expected_att_key; updated = True
+                if updated:
+                    changed = True
+            else:
                 new_sessions.append({
                     "id": f"{faculty_username}_{date_str}_{slot_id}_{section}",
                     "date": date_str,
@@ -200,16 +258,17 @@ def generate_sessions_for_week(faculty_username: str, dept: str):
                     "substitute": None,
                     "att_key": f"{section}::{slot_id}::{date_str}",
                 })
-                existing_keys.add(key)
 
     if new_sessions:
         db["sessions"].extend(new_sessions)
+        changed = True
+    if changed:
         save_db()
 
 def get_faculty_sessions(faculty_username: str, week_offset: int = 0):
     today = datetime.date.today()
     monday = today - datetime.timedelta(days=today.weekday()) + datetime.timedelta(weeks=week_offset)
-    saturday = monday + datetime.timedelta(days=5)
+    sunday = monday + datetime.timedelta(days=6)
     result = []
     for s in db["sessions"]:
         if s.get("faculty_username") != faculty_username and s.get("substitute") != faculty_username:
@@ -218,7 +277,7 @@ def get_faculty_sessions(faculty_username: str, week_offset: int = 0):
             d = datetime.date.fromisoformat(s["date"])
         except Exception:
             continue
-        if monday <= d <= saturday:
+        if monday <= d <= sunday:
             result.append(s)
     return result
 
@@ -242,7 +301,7 @@ def get_student_photo_b64(roll: str):
 #  CAMERA
 # ═══════════════════════════════════════════════════════════════════════════════
 def camera_loop(cam_id: str, source):
-    cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    cap = cv2.VideoCapture(source)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
     if not cap.isOpened():
         print(f"❌ Cannot open camera {cam_id}")
@@ -337,73 +396,141 @@ def liveness(f1, f2):
     except Exception:
         return True, 0.5
 
-def verify(cam_id: str, section: str, slot_id: str, dept: str, faculty: str) -> dict:
+def capture_frame_detections(cam_id: str) -> set:
+    """Capture one frame and return a set of matched student names."""
     TOLE = 0.6
     if not (INSIGHTFACE_AVAILABLE and face_app):
-        return {"success": False, "message": "Face recognition not available"}
+        return set()
     with frame_lock:
-        f1 = camera_frames.get(cam_id)
-    if f1 is None:
-        return {"success": False, "message": "No camera frame"}
-    f1 = f1.copy()
-    time.sleep(3)
-    with frame_lock:
-        f2 = camera_frames.get(cam_id)
-    if f2 is None:
-        return {"success": False, "message": "Camera frame lost"}
-    f2 = f2.copy()
+        frame = camera_frames.get(cam_id)
+    if frame is None:
+        return set()
+    frame = frame.copy()
+    try:
+        faces = face_app.get(frame)
+        detected = set()
+        for face in faces:
+            name, dist = match_face(face.embedding)
+            if name and dist < TOLE:
+                detected.add(name)
+        return detected
+    except Exception:
+        return set()
 
-    fa1, fa2 = face_app.get(f1), face_app.get(f2)
-    if not fa1: return {"success": False, "message": "No face detected"}
-    if not fa2: return {"success": False, "message": "Face lost between frames"}
-    if not known_embeddings: return {"success": False, "message": "No faces in database"}
 
-    alive, mv = liveness(f1, f2)
-    mc, md = {}, {}
-    for ffs in (fa1, fa2):
-        for face in ffs:
-            n, d = match_face(face.embedding)
-            if n and d < TOLE:
-                mc[n] = mc.get(n,0)+1
-                md.setdefault(n,[]).append(d)
+def session_runner(session_id: str):
+    """
+    Background thread that auto-captures attendance at random ~10-min intervals.
+    Finalizes 1 minute before class ends.
+    A student is marked Present if detected in ≥2 captures.
+    """
+    with _session_lock:
+        info = active_sessions.get(session_id)
+    if not info:
+        return
 
-    confirmed = [n for n,c in mc.items() if c>=2 and alive]
-    if not confirmed:
-        return {"success": False, "message": "No confident match (liveness or threshold failed)"}
+    stop_evt      = info["stop_event"]
+    end_time      = info["end_time"]          # datetime
+    section       = info["section"]
+    slot_id       = info["slot_id"]
+    dept          = info["dept"]
+    faculty       = info["faculty"]
+    cam_id        = info["cam_id"]
+    date_str      = info["date"]
+    stu_name_to_roll = {s["name"]: s["roll"] for s in db["students"].get(section, [])}
 
-    date_str = datetime.date.today().isoformat()
-    stu_map = {s["name"]: s["roll"] for s in db["students"].get(section, [])}
-    key = f"{section}::{slot_id}::{date_str}"
-    marked_new, already = [], []
+    finalize_at = end_time - datetime.timedelta(minutes=1)
+    INTERVAL_BASE = 10 * 60   # 10 minutes in seconds
+    INTERVAL_JITTER = 90      # ±90 seconds
 
-    with _state_lock:
-        att_recs = db["attendance_records"].setdefault(key, [])
-        existing_rolls = {r["roll"] for r in att_recs}
-        now = datetime.datetime.now().strftime("%H:%M:%S")
-        for name in confirmed:
-            roll = stu_map.get(name, name)
-            if roll not in existing_rolls:
-                att_recs.append({"roll": roll, "name": name, "status": "Present",
-                                 "time": now, "marked_by": "face"})
-                existing_rolls.add(roll)
-                write_attendance_csv(roll, name, section, dept, slot_id, "", faculty)
-                marked_new.append(name)
-            else:
-                already.append(name)
+    def do_capture():
+        detected = capture_frame_detections(cam_id)
+        with _session_lock:
+            sess = active_sessions.get(session_id)
+            if sess is None:
+                return
+            sess["captures"] += 1
+            for name in detected:
+                sess["detected_counts"][name] = sess["detected_counts"].get(name, 0) + 1
 
-    save_db()
-    return {
-        "success": True,
-        "marked": sorted(marked_new),
-        "already_marked": sorted(already),
-        "message": f"Marked: {', '.join(sorted(marked_new))}" if marked_new else "Already recorded"
-    }
+    def finalize():
+        with _session_lock:
+            sess = active_sessions.get(session_id)
+            if sess is None:
+                return
+            sess["status"] = "finalizing"
+            detected_counts = dict(sess["detected_counts"])
+
+        # Mark present if detected in ≥2 captures
+        present_names = {name for name, cnt in detected_counts.items() if cnt >= 2}
+        all_students  = db["students"].get(section, [])
+        key = f"{section}::{slot_id}::{date_str}"
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+
+        with _state_lock:
+            # Build a fresh authoritative list — upsert every student
+            roll_to_rec = {}
+            for r in db["attendance_records"].get(key, []):
+                roll_to_rec[r["roll"]] = r
+
+            for stu in all_students:
+                roll   = stu["roll"]
+                name   = stu["name"]
+                status = "Present" if name in present_names else "Absent"
+                roll_to_rec[roll] = {
+                    "roll": roll, "name": name, "status": status,
+                    "time": now_str, "marked_by": "auto_session"
+                }
+
+            db["attendance_records"][key] = list(roll_to_rec.values())
+        # Rewrite CSV for this key to avoid duplicates from multiple finalize attempts
+        rewrite_attendance_csv_for_key(section, dept, slot_id, date_str,
+                                       db["attendance_records"][key], faculty)
+        save_db()
+
+        with _session_lock:
+            sess = active_sessions.get(session_id)
+            if sess:
+                sess["status"] = "completed"
+
+    # ── main loop ──────────────────────────────────────────────────────────────
+    # Do an initial capture shortly after start (30–90 s)
+    first_wait = 30 + (hash(session_id) % 60)
+    stop_evt.wait(timeout=first_wait)
+    if stop_evt.is_set():
+        finalize(); return
+    do_capture()
+
+    import random
+    while True:
+        now = datetime.datetime.now()
+        if now >= finalize_at:
+            finalize()
+            return
+
+        # Sleep until next capture or finalize time
+        next_capture = now + datetime.timedelta(
+            seconds=INTERVAL_BASE + random.randint(-INTERVAL_JITTER, INTERVAL_JITTER))
+        sleep_until  = min(next_capture, finalize_at)
+        secs_to_sleep = (sleep_until - datetime.datetime.now()).total_seconds()
+        if secs_to_sleep > 0:
+            stop_evt.wait(timeout=secs_to_sleep)
+        if stop_evt.is_set():
+            finalize(); return
+        now = datetime.datetime.now()
+        if now >= finalize_at:
+            finalize(); return
+        do_capture()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  AUTH HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def me():
-    return db["users"].get(session.get("username"), {})
+    """Return user dict or None (never empty dict, so `if not u` works correctly)."""
+    uname = session.get("username")
+    if not uname:
+        return None
+    return db["users"].get(uname) or None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ROUTES — AUTH
@@ -474,19 +601,27 @@ def faculty_calendar():
         return jsonify({"sessions": []}), 401
     week_offset = int(request.args.get("week", 0))
     uname = session.get("username")
+    dept = u.get("department") or ""
+    if not dept:
+        for s in db["sessions"]:
+            if s.get("faculty_username") == uname and s.get("dept"):
+                dept = s["dept"]
+                break
+    # Generate sessions for the requested week
+    generate_sessions_for_week(uname, dept, week_offset)
     sessions = get_faculty_sessions(uname, week_offset)
     for s in sessions:
-        key = s.get("att_key","")
+        key = s.get("att_key", "")
         recs = db["attendance_records"].get(key, [])
-        total = len(db["students"].get(s["section"], []))
+        all_stu = db["students"].get(s["section"], [])
+        total = len(all_stu)
         present = sum(1 for r in recs if r["status"] == "Present")
         s["att_count"] = present
         s["total_students"] = total
-        s["att_marked"] = len(recs) > 0
-        # Resolve original faculty display name (used when this session is a substitute)
-        orig_user = db["users"].get(s.get("faculty_username",""), {})
-        s["faculty_name"] = orig_user.get("name", s.get("faculty_username",""))
-        # Resolve substitute display name
+        # att_marked: true only when every student has a record
+        s["att_marked"] = len(recs) >= total > 0
+        orig_user = db["users"].get(s.get("faculty_username", ""), {})
+        s["faculty_name"] = orig_user.get("name", s.get("faculty_username", ""))
         if s.get("substitute"):
             sub_user = db["users"].get(s["substitute"], {})
             s["substitute_name"] = sub_user.get("name", s["substitute"])
@@ -526,18 +661,127 @@ def faculty_session_detail():
         "total": len(all_students),
     })
 
-@app.route("/faculty/mark_attendance", methods=["POST"])
-def faculty_mark_attendance():
+@app.route("/faculty/start_session", methods=["POST"])
+def faculty_start_session():
     u = me()
     if not u:
         return jsonify({"success": False, "message": "Not logged in"}), 401
-    d       = request.get_json(silent=True) or {}
-    section = d.get("section","")
-    slot_id = d.get("slot_id","")
-    cam_id  = d.get("cam_id","default")
-    dept    = u.get("department","")
-    result  = verify(cam_id, section, slot_id, dept, u.get("name",""))
-    return jsonify(result)
+    d          = request.get_json(silent=True) or {}
+    session_id = d.get("session_id", "")
+    cam_id     = d.get("cam_id", "default")
+
+    sess = next((s for s in db["sessions"] if s["id"] == session_id), None)
+    if not sess:
+        return jsonify({"success": False, "message": "Session not found"}), 404
+
+    uname = session.get("username")
+    if sess["faculty_username"] != uname and sess.get("substitute") != uname:
+        if u.get("role") not in ("admin", "dept_head"):
+            return jsonify({"success": False, "message": "Forbidden"}), 403
+
+    # already running?
+    with _session_lock:
+        if session_id in active_sessions and active_sessions[session_id]["status"] in ("running", "finalizing"):
+            info = active_sessions[session_id]
+            return jsonify({
+                "success": True,
+                "already_running": True,
+                "captures": info["captures"],
+                "status": info["status"],
+                "end_time": info["end_time"].strftime("%H:%M"),
+                "finalize_at": (info["end_time"] - datetime.timedelta(minutes=1)).strftime("%H:%M"),
+            })
+
+    # parse slot end time to build end datetime
+    slot_end_str = sess.get("slot_end", "")
+    sess_date    = sess.get("date", datetime.date.today().isoformat())
+    try:
+        h, m = map(int, slot_end_str.split(":"))
+        date_obj  = datetime.date.fromisoformat(sess_date)
+        end_dt    = datetime.datetime.combine(date_obj, datetime.time(h, m))
+    except Exception:
+        return jsonify({"success": False, "message": "Could not parse slot end time"}), 400
+
+    # If the class period is already over, still allow manual attendance marking
+    # but don't start the auto-capture thread
+    now = datetime.datetime.now()
+    if now >= end_dt:
+        # Allow session to be "started" for manual attendance even if time passed
+        # Mark it completed immediately so manual save is still possible
+        return jsonify({
+            "success": False,
+            "message": "Class period has ended. Use manual attendance marking below.",
+            "period_ended": True,
+        }), 200
+
+    stop_evt = threading.Event()
+    info = {
+        "session_id": session_id,
+        "section":    sess["section"],
+        "slot_id":    sess["slot_id"],
+        "dept":       sess.get("dept", u.get("department", "")),
+        "faculty":    u.get("name", ""),
+        "cam_id":     cam_id,
+        "date":       sess_date,
+        "end_time":   end_dt,
+        "stop_event": stop_evt,
+        "captures":   0,
+        "detected_counts": {},
+        "status":     "running",
+        "started_at": now.isoformat(),
+    }
+    with _session_lock:
+        active_sessions[session_id] = info
+
+    t = threading.Thread(target=session_runner, args=(session_id,), daemon=True)
+    info["thread"] = t
+    t.start()
+
+    return jsonify({
+        "success": True,
+        "message": "Session started — attendance will be captured automatically",
+        "end_time": end_dt.strftime("%H:%M"),
+        "finalize_at": (end_dt - datetime.timedelta(minutes=1)).strftime("%H:%M"),
+    })
+
+
+@app.route("/faculty/session_status")
+def faculty_session_status():
+    u = me()
+    if not u:
+        return jsonify({}), 401
+    session_id = request.args.get("id", "")
+    with _session_lock:
+        info = active_sessions.get(session_id)
+    if not info:
+        return jsonify({"active": False})
+
+    section  = info["section"]
+    slot_id  = info["slot_id"]
+    date_str = info["date"]
+    key      = f"{section}::{slot_id}::{date_str}"
+    recs     = db["attendance_records"].get(key, [])
+    total    = len(db["students"].get(section, []))
+    present  = sum(1 for r in recs if r["status"] == "Present")
+
+    # compute minutes remaining
+    now = datetime.datetime.now()
+    end_time = info["end_time"]
+    mins_left = max(0, int((end_time - now).total_seconds() // 60))
+
+    return jsonify({
+        "active":    info["status"] in ("running", "finalizing"),
+        "status":    info["status"],
+        "captures":  info["captures"],
+        "mins_left": mins_left,
+        "end_time":  end_time.strftime("%H:%M"),
+        "present":   present,
+        "total":     total,
+        "detected_preview": [
+            {"name": name, "count": cnt}
+            for name, cnt in sorted(info["detected_counts"].items(), key=lambda x: -x[1])
+        ][:10],
+    })
 
 @app.route("/faculty/save_attendance", methods=["POST"])
 def faculty_save_attendance():
@@ -545,20 +789,35 @@ def faculty_save_attendance():
     if not u:
         return jsonify({"success": False}), 401
     d        = request.get_json(silent=True) or {}
-    section  = d.get("section","")
-    slot_id  = d.get("slot_id","")
+    section  = d.get("section", "")
+    slot_id  = d.get("slot_id", "")
     date_str = d.get("date", datetime.date.today().isoformat())
-    records  = d.get("records",[])
-    dept     = u.get("department","")
+    records  = d.get("records", [])
+    dept     = u.get("department", "") or ""
+
+    if not section or not slot_id:
+        return jsonify({"success": False, "error": "section and slot_id required"}), 400
+
+    # Normalise records: ensure each has roll, name, status
+    clean_records = []
+    for r in records:
+        if not r.get("roll"):
+            continue
+        clean_records.append({
+            "roll":      r["roll"],
+            "name":      r.get("name", r["roll"]),
+            "status":    r.get("status", "Absent"),
+            "time":      datetime.datetime.now().strftime("%H:%M:%S"),
+            "marked_by": session.get("username", "faculty"),
+        })
 
     key = f"{section}::{slot_id}::{date_str}"
     with _state_lock:
-        db["attendance_records"][key] = records
+        db["attendance_records"][key] = clean_records
     save_db()
-    for r in records:
-        write_attendance_csv(r["roll"], r.get("name",""), section, dept,
-                             slot_id, "", u.get("name",""), r.get("status","Present"))
-    return jsonify({"success": True, "saved": len(records)})
+    # Use rewrite to avoid duplicate CSV rows on re-saves
+    rewrite_attendance_csv_for_key(section, dept, slot_id, date_str, clean_records, u.get("name",""))
+    return jsonify({"success": True, "saved": len(clean_records)})
 
 @app.route("/faculty/attendance_list")
 def faculty_attendance_list():
@@ -725,7 +984,10 @@ def dept_save_timetable():
 
     faculty_user = db["users"].get(faculty_username, {})
     dept = faculty_user.get("department", u.get("department",""))
-    generate_sessions_for_week(faculty_username, dept)
+    # Regenerate sessions for past 4 weeks, current week and next 2 weeks
+    # so changes are immediately visible in both faculty calendar and dept sessions
+    for offset in range(-4, 3):
+        generate_sessions_for_week(faculty_username, dept, offset)
 
     return jsonify({"success": True})
 
@@ -803,7 +1065,8 @@ def dept_upload_timetable_excel():
         for fac_uname in updated_faculty:
             fac_user = db["users"].get(fac_uname, {})
             dept = fac_user.get("department", u.get("department", ""))
-            generate_sessions_for_week(fac_uname, dept)
+            for offset in range(-4, 3):
+                generate_sessions_for_week(fac_uname, dept, offset)
         save_db()
         return jsonify({"success": True, "faculty_updated": len(updated_faculty), "skipped": skipped})
     except Exception as e:
@@ -812,42 +1075,284 @@ def dept_upload_timetable_excel():
 
 @app.route("/dept/timetable_template_excel")
 def dept_timetable_template_excel():
-    """Download a pre-filled template Excel for bulk timetable upload."""
+    """Download a polished, pre-filled template Excel for bulk timetable upload."""
     u = me()
     if not u or u["role"] not in ("admin", "dept_head"):
         return Response("Forbidden", status=403)
     if not OPENPYXL_AVAILABLE:
         return Response("openpyxl not installed", status=500)
+
+    from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
+                                  GradientFill)
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
+
     dept = u["department"] if u["role"] == "dept_head" else "CSE"
     faculty_list = [
         (un, ud["name"])
         for un, ud in db["users"].items()
         if ud.get("department") == dept and ud["role"] in ("faculty", "dept_head")
     ]
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Timetable"
-    ws.append(["Faculty", "Day", "Period", "Section", "Subject", "Camera"])
     period_slots = [s for s in TIME_SLOTS if s["id"] not in BREAK_SLOTS]
-    for fac_un, _ in faculty_list:
+
+    # ── colour palette ────────────────────────────────────────────────────────
+    C_HEADER_BG   = "1F3864"   # dark navy  – sheet main header
+    C_HEADER_FG   = "FFFFFF"
+    C_DAY_BG      = "2E75B6"   # blue       – day group header
+    C_DAY_FG      = "FFFFFF"
+    C_SUN_BG      = "FFF2CC"   # pale amber – Sunday rows
+    C_SAT_BG      = "EBF3FB"   # pale blue  – Saturday rows
+    C_ALT_BG      = "F5F8FF"   # very light – alternating data rows
+    C_WHITE       = "FFFFFF"
+    C_BORDER      = "B8CCE4"
+    C_REQ_BG      = "FFF2CC"   # yellow     – required-field header
+    C_OPT_BG      = "E2EFDA"   # green      – optional-field header
+
+    def _font(bold=False, size=11, color="000000", italic=False):
+        return Font(name="Calibri", bold=bold, size=size, color=color, italic=italic)
+
+    def _fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def _border(style="thin", color=C_BORDER):
+        s = Side(style=style, color=color)
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def _align(h="left", v="center", wrap=False):
+        return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+    wb = openpyxl.Workbook()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 1 – Timetable Data
+    # ══════════════════════════════════════════════════════════════════════════
+    ws = wb.active
+    ws.title = "Timetable Data"
+    ws.freeze_panes = "A4"          # freeze title + column-header rows
+    ws.sheet_view.showGridLines = False
+
+    # ── Row 1: big title banner ───────────────────────────────────────────────
+    ws.merge_cells("A1:G1")
+    title_cell = ws["A1"]
+    title_cell.value = f"📅  {dept} Department — Timetable Upload Template"
+    title_cell.font  = _font(bold=True, size=14, color=C_HEADER_FG)
+    title_cell.fill  = _fill(C_HEADER_BG)
+    title_cell.alignment = _align("center")
+    ws.row_dimensions[1].height = 30
+
+    # ── Row 2: subtitle / instructions line ───────────────────────────────────
+    ws.merge_cells("A2:G2")
+    sub = ws["A2"]
+    sub.value = ("Fill in Section and Subject for each period. "
+                 "Leave the row blank to skip that period. "
+                 "Yellow columns are required  •  Green columns are optional.")
+    sub.font      = _font(size=9, color="595959", italic=True)
+    sub.fill      = _fill("D9E1F2")
+    sub.alignment = _align("center")
+    ws.row_dimensions[2].height = 18
+
+    # ── Row 3: column headers ─────────────────────────────────────────────────
+    COL_HEADERS = [
+        ("Faculty Username",  C_REQ_BG, 22),
+        ("Faculty Name",      "DAEEF3", 22),
+        ("Day",               C_REQ_BG, 14),
+        ("Period",            C_REQ_BG, 14),
+        ("Time",              "DAEEF3", 16),
+        ("Section",           C_REQ_BG, 16),
+        ("Subject",           C_REQ_BG, 24),
+    ]
+    for col_idx, (label, bg, width) in enumerate(COL_HEADERS, start=1):
+        cell = ws.cell(row=3, column=col_idx, value=label)
+        cell.font      = _font(bold=True, size=10, color="1F3864")
+        cell.fill      = _fill(bg)
+        cell.alignment = _align("center")
+        cell.border    = _border("medium", "2E75B6")
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    ws.row_dimensions[3].height = 22
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    row = 4
+    day_colors = {
+        "Sunday":   C_SUN_BG,
+        "Saturday": C_SAT_BG,
+    }
+
+    # Data-validation lists (hidden sheet referenced below)
+    fac_usernames = [f for f, _ in faculty_list] or ["faculty_username"]
+    fac_name_map  = {f: n for f, n in faculty_list}
+    day_list      = ",".join(DAYS)
+    period_list   = ",".join(s["label"] for s in period_slots)
+
+    dv_day = DataValidation(type="list", formula1=f'"{day_list}"',
+                            showDropDown=False, showErrorMessage=True,
+                            error="Choose a valid day", errorTitle="Invalid Day")
+    dv_period = DataValidation(type="list", formula1=f'"{period_list}"',
+                               showDropDown=False, showErrorMessage=True,
+                               error="Choose a valid period", errorTitle="Invalid Period")
+    ws.add_data_validation(dv_day)
+    ws.add_data_validation(dv_period)
+
+    all_data_rows = []
+    for fac_un, fac_name in faculty_list:
         for day in DAYS:
             for slot in period_slots:
-                ws.append([fac_un, day, slot["label"], "", "", "default"])
-    ws2 = wb.create_sheet("Instructions")
-    ws2.append(["Column", "Description", "Valid Values"])
-    ws2.append(["Faculty", "Faculty username (login ID)", "Any existing faculty username"])
-    ws2.append(["Day", "Day of week", ", ".join(DAYS)])
-    ws2.append(["Period", "Period label", ", ".join(s["label"] for s in period_slots)])
-    ws2.append(["Section", "Class section", "e.g. CSE-1, ECE-3"])
-    ws2.append(["Subject", "Subject name", "Free text"])
-    ws2.append(["Camera", "Camera ID (optional)", "default"])
+                all_data_rows.append((fac_un, fac_name, day, slot))
+
+    # If no faculty yet, add sample rows
+    if not all_data_rows:
+        for day in DAYS:
+            for slot in period_slots:
+                all_data_rows.append(("faculty_username", "Faculty Full Name",
+                                      day, slot))
+
+    for fac_un, fac_name, day, slot in all_data_rows:
+        time_str = f"{slot['start']} – {slot['end']}"
+        row_data = [fac_un, fac_name, day, slot["label"], time_str, "", ""]
+
+        bg = day_colors.get(day, C_WHITE if row % 2 == 0 else C_ALT_BG)
+
+        for col_idx, value in enumerate(row_data, start=1):
+            cell = ws.cell(row=row, column=col_idx, value=value)
+            cell.fill      = _fill(bg)
+            cell.font      = _font(size=10)
+            cell.alignment = _align("center" if col_idx in (3,4,5) else "left")
+            cell.border    = _border("thin")
+
+        # Lock Faculty / Day / Period / Time as read-only hints (light grey text)
+        for col_idx in (1, 2, 3, 4, 5):
+            ws.cell(row=row, column=col_idx).font = _font(size=10, color="595959")
+
+        dv_day.add(ws.cell(row=row, column=3))
+        dv_period.add(ws.cell(row=row, column=4))
+        row += 1
+
+    ws.row_dimensions[row].height = 6   # small gap at end
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 2 – Faculty List  (quick reference)
+    # ══════════════════════════════════════════════════════════════════════════
+    wf = wb.create_sheet("Faculty List")
+    wf.sheet_view.showGridLines = False
+
+    wf.merge_cells("A1:C1")
+    hdr = wf["A1"]
+    hdr.value     = f"Faculty Reference — {dept}"
+    hdr.font      = _font(bold=True, size=12, color=C_HEADER_FG)
+    hdr.fill      = _fill(C_HEADER_BG)
+    hdr.alignment = _align("center")
+    wf.row_dimensions[1].height = 26
+
+    for ci, (label, w) in enumerate(
+            [("Username (use in template)", 28), ("Full Name", 28), ("Department", 18)],
+            start=1):
+        c = wf.cell(row=2, column=ci, value=label)
+        c.font      = _font(bold=True, size=10, color="1F3864")
+        c.fill      = _fill("D9E1F2")
+        c.alignment = _align("center")
+        c.border    = _border("medium", "2E75B6")
+        wf.column_dimensions[get_column_letter(ci)].width = w
+    wf.row_dimensions[2].height = 20
+
+    for i, (un, name) in enumerate(faculty_list, start=3):
+        bg = C_WHITE if i % 2 == 0 else C_ALT_BG
+        for ci, val in enumerate([un, name, dept], start=1):
+            c = wf.cell(row=i, column=ci, value=val)
+            c.font      = _font(size=10)
+            c.fill      = _fill(bg)
+            c.alignment = _align("left")
+            c.border    = _border()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHEET 3 – Instructions
+    # ══════════════════════════════════════════════════════════════════════════
+    wi = wb.create_sheet("Instructions")
+    wi.sheet_view.showGridLines = False
+    wi.column_dimensions["A"].width = 26
+    wi.column_dimensions["B"].width = 48
+    wi.column_dimensions["C"].width = 42
+
+    wi.merge_cells("A1:C1")
+    t = wi["A1"]
+    t.value     = "📖  How to Fill the Timetable Template"
+    t.font      = _font(bold=True, size=13, color=C_HEADER_FG)
+    t.fill      = _fill(C_HEADER_BG)
+    t.alignment = _align("center")
+    wi.row_dimensions[1].height = 28
+
+    # column headers
+    for ci, label in enumerate(["Column", "What to Enter", "Valid Values / Notes"], start=1):
+        c = wi.cell(row=2, column=ci, value=label)
+        c.font      = _font(bold=True, size=10, color="1F3864")
+        c.fill      = _fill("D9E1F2")
+        c.alignment = _align("center")
+        c.border    = _border("medium", "2E75B6")
+    wi.row_dimensions[2].height = 20
+
+    instructions = [
+        ("Faculty Username", "Login username of the faculty member",
+         "See 'Faculty List' sheet for all valid usernames"),
+        ("Faculty Name",     "Auto-filled for reference — do not change",
+         "Read-only reference column"),
+        ("Day",              "Day of the week for this class",
+         f"{', '.join(DAYS)}\n(Sunday = extra / special classes only)"),
+        ("Period",           "Period label for the class",
+         ", ".join(s["label"] for s in period_slots)),
+        ("Time",             "Auto-filled — do not change",
+         "Read-only, shows period start–end time"),
+        ("Section",          "Class section (REQUIRED)",
+         "e.g.  CSE-A,  ECE-2,  MECH-B"),
+        ("Subject",          "Subject / course name (REQUIRED)",
+         "e.g.  Data Structures,  DBMS,  Thermodynamics"),
+    ]
+
+    for i, (col, what, vals) in enumerate(instructions, start=3):
+        bg = C_WHITE if i % 2 == 0 else C_ALT_BG
+        data = [(col, "1F3864", True), (what, "000000", False), (vals, "595959", False)]
+        for ci, (val, clr, bold) in enumerate(data, start=1):
+            c = wi.cell(row=i, column=ci, value=val)
+            c.font      = _font(bold=bold, size=10, color=clr)
+            c.fill      = _fill(bg)
+            c.alignment = _align("left", wrap=True)
+            c.border    = _border()
+        wi.row_dimensions[i].height = 30
+
+    # Tips section
+    tip_row = len(instructions) + 4
+    wi.merge_cells(f"A{tip_row}:C{tip_row}")
+    t2 = wi.cell(row=tip_row, column=1, value="💡  Tips")
+    t2.font      = _font(bold=True, size=11, color=C_HEADER_FG)
+    t2.fill      = _fill(C_DAY_BG)
+    t2.alignment = _align("left")
+    wi.row_dimensions[tip_row].height = 22
+
+    tips = [
+        "Leave Section and Subject empty to skip a period — the row will be ignored on upload.",
+        "Sunday rows are included for extra/special classes only. Leave them blank if unused.",
+        "You can delete entire rows for periods you never use to keep the file tidy.",
+        "Do NOT change Faculty Username, Day, Period, or Time columns — they are pre-filled.",
+        "Upload this file via Department → Timetable → Upload Excel Timetable.",
+    ]
+    for j, tip in enumerate(tips, start=tip_row + 1):
+        wi.merge_cells(f"A{j}:C{j}")
+        c = wi.cell(row=j, column=1, value=f"  ✔  {tip}")
+        c.font      = _font(size=10, color="1F3864")
+        c.fill      = _fill(C_ALT_BG if j % 2 == 0 else C_WHITE)
+        c.alignment = _align("left", wrap=True)
+        c.border    = _border()
+        wi.row_dimensions[j].height = 18
+
+    # ── finalise ──────────────────────────────────────────────────────────────
+    # Set active sheet back to data sheet
+    wb.active = ws
+
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
     return Response(
         out.getvalue(),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=timetable_template_{dept}.xlsx"}
+        headers={"Content-Disposition":
+                 f"attachment; filename=timetable_template_{dept}.xlsx"}
     )
 
 
@@ -860,12 +1365,38 @@ def dept_sessions():
     dept = u["department"] if u["role"]=="dept_head" else request.args.get("dept","CSE")
     section = request.args.get("section","")
     date_filter = request.args.get("date","")
-    sessions = [
-        s for s in db["sessions"]
-        if s.get("dept")==dept
-        and (not section or s.get("section")==section)
-        and (not date_filter or s.get("date")==date_filter)
-    ]
+    week_offset = int(request.args.get("week", 0))
+
+    # Generate sessions for every faculty in this dept for the requested week
+    # so faculty calendar is always in sync with what dept_head sees
+    for uname, ud in db["users"].items():
+        if ud.get("department") == dept and ud["role"] in ("faculty","dept_head"):
+            generate_sessions_for_week(uname, dept, week_offset)
+
+    # Compute week date range for filtering when no specific date_filter provided
+    today = datetime.date.today()
+    monday = today - datetime.timedelta(days=today.weekday()) + datetime.timedelta(weeks=week_offset)
+    sunday = monday + datetime.timedelta(days=6)
+
+    sessions = []
+    for s in db["sessions"]:
+        if s.get("dept") != dept:
+            continue
+        if section and s.get("section") != section:
+            continue
+        if date_filter:
+            if s.get("date") != date_filter:
+                continue
+        else:
+            # Filter by week range
+            try:
+                sess_date = datetime.date.fromisoformat(s["date"])
+            except Exception:
+                continue
+            if not (monday <= sess_date <= sunday):
+                continue
+        sessions.append(s)
+
     for s in sessions:
         key = s.get("att_key","")
         recs = db["attendance_records"].get(key, [])
@@ -873,6 +1404,7 @@ def dept_sessions():
         present = sum(1 for r in recs if r["status"] == "Present")
         s["att_count"] = present
         s["total_students"] = total
+        s["att_marked"] = len(recs) >= total > 0
         orig_user = db["users"].get(s.get("faculty_username",""), {})
         s["faculty_name"] = orig_user.get("name", s.get("faculty_username",""))
         if s.get("substitute"):
@@ -897,6 +1429,17 @@ def dept_assign_substitute():
 
     sess["substitute"] = substitute
     save_db()
+
+    # Regenerate sessions for BOTH the original faculty and the substitute
+    # so the substitute's calendar immediately reflects the new assignment
+    for uname in {sess["faculty_username"], substitute}:
+        if not uname:
+            continue
+        fac_user = db["users"].get(uname, {})
+        dept = fac_user.get("department", sess.get("dept", ""))
+        for offset in range(-4, 3):
+            generate_sessions_for_week(uname, dept, offset)
+
     return jsonify({"success": True})
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
@@ -1171,11 +1714,12 @@ def dept_download_attendance():
         return Response("Forbidden",status=403)
     if not OPENPYXL_AVAILABLE:
         return Response("openpyxl not installed",status=500)
+    import openpyxl as _openpyxl
 
     section = request.args.get("section","")
     date    = request.args.get("date", datetime.date.today().isoformat())
 
-    wb = openpyxl.Workbook()
+    wb = _openpyxl.Workbook()
     ws = wb.active
     ws.title = f"{section} {date}"
     ws.append(["Roll", "Name", "Period 1", "Period 2", "Period 3",
