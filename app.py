@@ -155,21 +155,26 @@ def write_attendance_csv(roll, name, section, dept, slot_id, subject, faculty, s
 def rewrite_attendance_csv_for_key(section, dept, slot_id, date_str, records, faculty):
     """Rewrite ALL rows for a specific section+slot+date in the CSV to avoid duplicates.
     Called by faculty_save_attendance and dept_update_attendance on every manual save."""
+    CANONICAL_FIELDS = ["Roll","Name","Section","Department","Slot","Subject","Faculty","Date","Time","Status"]
     if not os.path.exists(CSV_FILE):
         setup_csv()
-        return
     # Read existing rows that are NOT for this key
     kept_rows = []
-    with open(CSV_FILE, newline="") as f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames or ["Roll","Name","Section","Department","Slot","Subject","Faculty","Date","Time","Status"]
-        for row in reader:
-            if not (row.get("Section") == section and row.get("Slot") == slot_id and row.get("Date") == date_str):
-                kept_rows.append(row)
-    # Rewrite file with kept rows + fresh records for this key
+    try:
+        with open(CSV_FILE, newline="") as f:
+            reader = csv.DictReader(f)
+            old_fields = reader.fieldnames or []
+            # Only keep old rows if the CSV has the canonical headers
+            if set(CANONICAL_FIELDS).issubset(set(old_fields)):
+                for row in reader:
+                    if not (row.get("Section") == section and row.get("Slot") == slot_id and row.get("Date") == date_str):
+                        kept_rows.append({k: row.get(k,"") for k in CANONICAL_FIELDS})
+    except Exception:
+        pass
+    # Rewrite file with canonical headers + kept rows + fresh records for this key
     time_str = datetime.datetime.now().strftime("%H:%M:%S")
     with open(CSV_FILE, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=CANONICAL_FIELDS)
         w.writeheader()
         w.writerows(kept_rows)
         for r in records:
@@ -1516,8 +1521,22 @@ def dept_update_attendance():
         pass
 
     key = f"{section}::{slot_id}::{date_str}"
-    db["attendance_records"][key] = records
+    # Normalize records to ensure consistent structure
+    clean_records = []
+    for r in records:
+        if not r.get("roll"):
+            continue
+        clean_records.append({
+            "roll":      r["roll"],
+            "name":      r.get("name", r["roll"]),
+            "status":    r.get("status", "Absent"),
+            "time":      datetime.datetime.now().strftime("%H:%M:%S"),
+            "marked_by": session.get("username", "dept_head"),
+        })
+    db["attendance_records"][key] = clean_records
     save_db()
+    dept = u.get("department", "")
+    rewrite_attendance_csv_for_key(section, dept, slot_id, date_str, clean_records, u.get("name",""))
     return jsonify({"success": True})
 
 # ── Student search ────────────────────────────────────────────────────────────
