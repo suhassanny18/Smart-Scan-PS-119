@@ -95,7 +95,7 @@ input,select,textarea,button{font-family:inherit}
 .status-txt.ok{background:#dcfce7;color:#15803d}.status-txt.fail{background:#fef2f2;color:var(--red)}.status-txt.busy{background:#fefce8;color:var(--amber)}.status-txt.info{background:var(--blue3);color:var(--blue)}
 .toast{position:fixed;bottom:22px;right:22px;z-index:9999;padding:12px 18px;border-radius:10px;font-size:13px;font-weight:600;color:#fff;opacity:0;transform:translateY(8px);transition:.3s;pointer-events:none}
 .toast.show{opacity:1;transform:translateY(0)}
-.toast.ok{background:#16a34a}.toast.err{background:#dc2626}.toast.info{background:var(--blue)}
+.toast.ok{background:#16a34a}.toast.err{background:#dc2626}.toast.info{background:var(--blue)}.toast.warn{background:#d97706}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:20px}
 .stat-box{background:#fff;border-radius:var(--radius);border:1px solid var(--grey3);padding:18px;text-align:center}
 .stat-box .num{font-size:30px;font-weight:800;color:var(--blue)}
@@ -130,9 +130,10 @@ input,select,textarea,button{font-family:inherit}
 .stu-row:hover{background:var(--grey1)}
 
 /* ── Calendar / Sessions ── */
-.cal-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-bottom:20px}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:20px}
 .cal-day-hdr{font-size:12px;font-weight:700;color:var(--text2);text-align:center;padding:8px 4px;background:var(--grey1);border-radius:6px}
 .cal-day-hdr.today-hdr{background:var(--blue3);color:var(--blue)}
+.cal-day-hdr.sunday-hdr{background:#fff3cd;color:#92600a}
 .cal-col{display:flex;flex-direction:column;gap:6px}
 .session-card{background:#fff;border:1.5px solid var(--grey3);border-radius:8px;padding:10px 12px;cursor:pointer;transition:.15s;position:relative}
 .session-card:hover{border-color:var(--blue);box-shadow:0 2px 8px rgba(0,61,122,.12)}
@@ -203,8 +204,8 @@ input,select,textarea,button{font-family:inherit}
 /* ── Manual student add ── */
 .manual-add-row{display:flex;gap:8px;align-items:flex-end;margin-bottom:12px;padding:12px;background:var(--blue3);border-radius:8px}
 
-@media(max-width:900px){.cal-grid{grid-template-columns:repeat(3,1fr)}.topbar{padding:0 14px}.content{padding:14px}}
-@media(max-width:600px){.cal-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:900px){.cal-grid{grid-template-columns:repeat(4,1fr)}.topbar{padding:0 14px}.content{padding:14px}}
+@media(max-width:600px){.cal-grid{grid-template-columns:repeat(2,1fr)}}
 </style>
 </head>
 <body>
@@ -317,7 +318,7 @@ input,select,textarea,button{font-family:inherit}
             <label>View / Edit Day</label>
             <select id="ttDay" onchange="loadTimetable()">
               <option>Monday</option><option>Tuesday</option><option>Wednesday</option>
-              <option>Thursday</option><option>Friday</option><option>Saturday</option>
+              <option>Thursday</option><option>Friday</option><option>Saturday</option><option>Sunday</option>
             </select>
           </div>
           <div style="padding-top:20px;display:flex;gap:8px;flex-wrap:wrap">
@@ -355,12 +356,19 @@ input,select,textarea,button{font-family:inherit}
             <select id="sessSection"><option value="">All Sections</option></select>
           </div>
           <div class="form-group" style="min-width:150px">
-            <label>Date</label>
+            <label>Date (exact date filter)</label>
             <input type="date" id="sessDate">
           </div>
-          <button class="btn btn-primary" onclick="loadSessions()">View</button>
+          <button class="btn btn-primary" onclick="sessWeekOffset=0;loadSessions()">View</button>
+          <button class="btn btn-ghost btn-sm" onclick="qs('sessDate').value='';loadSessions()" style="margin-bottom:1px">✕ Clear Date</button>
         </div>
-        <div id="sessGrid"><div style="color:var(--text2);text-align:center;padding:30px">Select filters above to view sessions</div></div>
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+          <button class="btn btn-ghost btn-sm" onclick="qs('sessDate').value='';sessWeekOffset--;loadSessions()">← Prev Week</button>
+          <span style="font-size:13px;font-weight:600;color:var(--blue)" id="sessWeekLabel">This Week</span>
+          <button class="btn btn-ghost btn-sm" onclick="qs('sessDate').value='';sessWeekOffset++;loadSessions()">Next Week →</button>
+          <button class="btn btn-ghost btn-sm" onclick="qs('sessDate').value='';sessWeekOffset=0;loadSessions()">Today</button>
+        </div>
+        <div id="sessGrid"><div style="color:var(--text2);text-align:center;padding:30px">Loading sessions…</div></div>
       </div>
     </div>
 
@@ -537,25 +545,54 @@ input,select,textarea,button{font-family:inherit}
     </div>
     <div class="modal-footer" id="sessionModalFooter">
       <button class="btn btn-ghost" onclick="qs('sessionModal').classList.add('hidden')">Close</button>
-      <button class="btn btn-primary" id="sessionMarkBtn" onclick="openMarkAttendance()">📸 Mark Attendance (Camera)</button>
-      <button class="btn btn-blue" id="sessionSaveBtn" onclick="saveSessionAttendance()" style="display:none">💾 Save Attendance</button>
+      <button class="btn btn-primary" id="sessionStartBtn" onclick="startAutoSession()">▶ Start Session</button>
+      <button class="btn btn-blue" id="sessionSaveBtn" onclick="saveSessionAttendance()">💾 Save Attendance</button>
     </div>
   </div>
 </div>
 
-<!-- Camera mark attendance panel -->
+<!-- Auto session status panel -->
 <div class="modal-overlay hidden" id="cameraModal">
-  <div class="modal" style="max-width:600px">
-    <div class="modal-hdr"><h3>📸 Camera Attendance</h3><button class="modal-close" onclick="closeCameraModal()">✕</button></div>
-    <div class="modal-body" style="padding:14px">
-      <img id="camFeed" src="" style="width:100%;border-radius:8px;background:#000;max-height:320px;object-fit:cover;display:block">
-      <div style="margin-top:12px;display:flex;gap:10px;align-items:center">
-        <select id="camSelect" style="flex:1;padding:8px;border:1.5px solid var(--grey3);border-radius:7px;font-size:13px"></select>
-        <button class="btn btn-primary" id="camMarkBtn" onclick="doFaceCapture()">✓ Capture & Mark</button>
+  <div class="modal" style="max-width:560px">
+    <div class="modal-hdr"><h3 id="autoSessTitle">🎓 Session in Progress</h3><button class="modal-close" onclick="closeAutoSessModal()">✕</button></div>
+    <div class="modal-body" style="padding:20px">
+
+      <!-- Live status strip -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px" id="autoSessStats">
+        <div style="background:var(--blue3);border-radius:8px;padding:12px;text-align:center">
+          <div style="font-size:22px;font-weight:800;color:var(--blue)" id="asCaptures">0</div>
+          <div style="font-size:11px;color:var(--text2);font-weight:600">Captures</div>
+        </div>
+        <div style="background:#dcfce7;border-radius:8px;padding:12px;text-align:center">
+          <div style="font-size:22px;font-weight:800;color:var(--green)" id="asPresent">—</div>
+          <div style="font-size:11px;color:var(--text2);font-weight:600">Present</div>
+        </div>
+        <div style="background:var(--orange3);border-radius:8px;padding:12px;text-align:center">
+          <div style="font-size:22px;font-weight:800;color:var(--orange2)" id="asMinsLeft">—</div>
+          <div style="font-size:11px;color:var(--text2);font-weight:600">Min Left</div>
+        </div>
       </div>
-      <div class="status-txt info" style="margin-top:10px" id="camStatus">Camera ready</div>
+
+      <!-- Progress bar -->
+      <div style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-bottom:4px">
+          <span id="asStatusLabel">Starting…</span>
+          <span id="asEndLabel"></span>
+        </div>
+        <div class="pbar-wrap" style="height:10px"><div class="pbar" id="asProgressBar" style="width:0%"></div></div>
+      </div>
+
+      <!-- Detection preview list -->
+      <div id="asDetectedList" style="max-height:180px;overflow-y:auto;border:1px solid var(--grey3);border-radius:8px;display:none">
+        <div style="padding:8px 12px;font-size:11px;font-weight:700;color:var(--text2);background:var(--grey1);border-bottom:1px solid var(--grey3)">Detected this session (≥2 captures = Present)</div>
+        <div id="asDetectedRows"></div>
+      </div>
+
+      <div class="status-txt info" style="margin-top:14px" id="autoSessStatus">Ready to start</div>
     </div>
-    <div class="modal-footer"><button class="btn btn-ghost" onclick="closeCameraModal()">Close</button></div>
+    <div class="modal-footer">
+      <button class="btn btn-ghost" onclick="closeAutoSessModal()">Minimise</button>
+    </div>
   </div>
 </div>
 
@@ -668,7 +705,7 @@ const DEPT_SECS = {
   MECH:['MECH-1','MECH-2','MECH-3','MECH-4'],
   CIVIL:['CIVIL-1','CIVIL-2','CIVIL-3'],
 };
-const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 const SLOT_LABEL_MAP = {slot1:'Period 1',slot2:'Period 2',slot3:'Period 3',slot4:'Lunch',slot5:'Period 4',slot6:'Period 5',slot7:'Period 6',slot8:'Period 7',slot9:'Period 8'};
 
 /* ═══════════════════════════════════ UTILS ═══════════════════════════════════ */
@@ -756,21 +793,23 @@ function shiftWeek(n){
 async function loadCalendar(){
   const today=new Date();
   const monday=new Date(today);
-  monday.setDate(today.getDate()-today.getDay()+1+S.calWeekOffset*7);
-  const saturday=new Date(monday);saturday.setDate(monday.getDate()+5);
+  // getDay(): Sun=0,Mon=1..Sat=6 — treat Sunday as 7 so Monday calc always goes backward
+  const dow=today.getDay()||7;
+  monday.setDate(today.getDate()-dow+1+S.calWeekOffset*7);
+  const sunday=new Date(monday);sunday.setDate(monday.getDate()+6);
 
   const monStr=monday.toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
-  const satStr=saturday.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
-  qs('calWeekLabel').textContent=`${monStr} – ${satStr}`;
+  const sunStr=sunday.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
+  qs('calWeekLabel').textContent=`${monStr} – ${sunStr}`;
 
   const dayDates=[];
-  for(let i=0;i<6;i++){const d=new Date(monday);d.setDate(monday.getDate()+i);dayDates.push(d);}
+  for(let i=0;i<7;i++){const d=new Date(monday);d.setDate(monday.getDate()+i);dayDates.push(d);}
   const todayDateStr=new Date().toISOString().slice(0,10);
 
   qs('calDayHeaders').innerHTML=dayDates.map((d,i)=>{
     const iso=d.toISOString().slice(0,10);
     const isToday=iso===todayDateStr;
-    return `<div class="cal-day-hdr${isToday?' today-hdr':''}">${DAYS[i]}<br><span style="font-size:11px;font-weight:400">${d.toLocaleDateString('en-IN',{day:'2-digit',month:'short'})}</span></div>`;
+    return `<div class="cal-day-hdr${isToday?' today-hdr':(DAYS[i]==='Sunday'?' sunday-hdr':'')}">${DAYS[i]}<br><span style="font-size:11px;font-weight:400">${d.toLocaleDateString('en-IN',{day:'2-digit',month:'short'})}</span></div>`;
   }).join('');
 
   try{
@@ -795,7 +834,8 @@ async function loadCalendar(){
           const isToday=date===todayDateStr;
           const isSub=s.substitute===S.username;
           const isCurrent=isToday&&currentSlotId&&s.slot_id===currentSlotId.id;
-          const cls=isCurrent?'current-session':(s.att_marked?'completed':(isSub?'substitute-session':''));
+          const isAutoRunning=window._autoSessRunningId===s.id;
+          const cls=isAutoRunning?'current-session':(isCurrent?'current-session':(s.att_marked?'completed':(isSub?'substitute-session':'')));
           return `<div class="session-card ${cls}" onclick="openSessionModal('${s.id}')">
             ${isSub?`<div style="font-size:10px;color:var(--amber);font-weight:700;margin-bottom:3px;padding:3px 6px;background:#fffbeb;border-radius:4px;border-left:3px solid var(--amber)">📌 Sub for: ${s.faculty_name||s.faculty_username||'—'}</div>`:''}
             ${isCurrent?'<div style="font-size:10px;color:var(--orange2);font-weight:700;margin-bottom:3px">🔴 LIVE NOW</div>':''}
@@ -829,8 +869,18 @@ async function openSessionModal(sessionId){
     `;
 
     renderSessionStudents(d.students);
+    // Always show Save button so faculty can mark attendance manually
     qs('sessionSaveBtn').style.display='';
-    qs('sessionMarkBtn').style.display='';
+    // Set start button state based on whether auto-session is running for this session
+    const startBtn = qs('sessionStartBtn');
+    const isRunning = window._autoSessRunningId === sess.id;
+    if(isRunning){
+      startBtn.textContent = '⏹ Session Running';
+      startBtn.disabled = true;
+    } else {
+      startBtn.textContent = '▶ Start Session';
+      startBtn.disabled = false;
+    }
     qs('sessionModal').classList.remove('hidden');
   }catch(e){toast('Could not load session','err');}
 }
@@ -858,56 +908,144 @@ function toggleAttStatus(i){
 }
 
 async function saveSessionAttendance(){
-  if(!S.currentSession||!S.currentSessionStudents)return;
+  if(!S.currentSession||!S.currentSessionStudents){toast('No session selected','err');return;}
   const sess=S.currentSession;
   try{
+    // Always save whatever the faculty has toggled (present/absent)
     const d=await api('/faculty/save_attendance','POST',{
       section:sess.section,slot_id:sess.slot_id,date:sess.date,
       records:S.currentSessionStudents.map(s=>({roll:s.roll,name:s.name,status:s.status}))
     });
     if(d.success){
-      toast('Attendance saved ✓','ok');
+      toast(`Attendance saved ✓ (${d.saved} students)`,'ok');
       qs('sessionModal').classList.add('hidden');
       loadCalendar();
-    }else toast(d.error||'Error','err');
+    }else toast(d.error||'Save failed','err');
   }catch(e){toast('Server error','err');}
 }
 
-function openMarkAttendance(){
-  api('/cameras').then(d=>{
-    const sel=qs('camSelect');
-    sel.innerHTML=(d.cameras||[{id:'default',label:'Device Camera'}]).map(c=>`<option value="${c.id}">${c.label}</option>`).join('');
-    qs('camFeed').src=`/video_feed?cam=default&t=${Date.now()}`;
-    qs('camStatus').textContent='Camera ready';
-    qs('camStatus').className='status-txt info';
-    qs('cameraModal').classList.remove('hidden');
-  });
-}
+/* ── Automated Session ──────────────────────────────────────────────────────── */
+let _autoSessPoll = null;
 
-function closeCameraModal(){qs('cameraModal').classList.add('hidden');qs('camFeed').src='';}
-
-async function doFaceCapture(){
+async function startAutoSession(){
   if(!S.currentSession){toast('No session selected','err');return;}
-  const sess=S.currentSession;
-  const cam=qs('camSelect').value;
-  qs('camMarkBtn').disabled=true;
-  qs('camStatus').textContent='⏳ Capturing (liveness check ~3s)…';qs('camStatus').className='status-txt busy';
+  const sess = S.currentSession;
+
+  // Show panel immediately
+  qs('autoSessTitle').textContent = `🎓 ${sess.subject||'Session'} — ${sess.section}`;
+  qs('asCaptures').textContent  = '0';
+  qs('asPresent').textContent   = '—';
+  qs('asMinsLeft').textContent  = '—';
+  qs('asProgressBar').style.width = '0%';
+  qs('asEndLabel').textContent  = sess.slot_end ? `Ends ${sess.slot_end}` : '';
+  qs('autoSessStatus').textContent = '⏳ Starting session…';
+  qs('autoSessStatus').className = 'status-txt busy';
+  qs('asDetectedList').style.display = 'none';
+  qs('cameraModal').classList.remove('hidden');
+
+  const cam = 'default';
   try{
-    const d=await api('/faculty/mark_attendance','POST',{section:sess.section,slot_id:sess.slot_id,cam_id:cam,department:sess.dept});
+    const d = await api('/faculty/start_session','POST',{session_id: sess.id, cam_id: cam});
     if(d.success){
-      qs('camStatus').textContent=`✅ ${d.message}`;qs('camStatus').className='status-txt ok';
-      toast(d.message,'ok');
-      const fresh=await api(`/faculty/session_detail?id=${sess.id}`);
-      S.currentSessionStudents=fresh.students;
-      renderSessionStudents(fresh.students);
-    }else{qs('camStatus').textContent='❌ '+d.message;qs('camStatus').className='status-txt fail';}
-  }catch(e){qs('camStatus').textContent='❌ Server error';qs('camStatus').className='status-txt fail';}
-  finally{qs('camMarkBtn').disabled=false;}
+      qs('autoSessStatus').textContent = d.already_running
+        ? '🔄 Session already running — resuming'
+        : `✅ Session started — auto-capturing until ${d.finalize_at}`;
+      qs('autoSessStatus').className = 'status-txt ok';
+      window._autoSessRunningId = sess.id;
+      qs('sessionStartBtn').textContent = '⏹ Session Running';
+      qs('sessionStartBtn').disabled = true;
+      _startPolling(sess.id);
+    } else if(d.period_ended){
+      // Period ended — close camera modal, let faculty mark manually
+      qs('cameraModal').classList.add('hidden');
+      toast('Class period ended — mark attendance manually below','warn');
+      qs('sessionStartBtn').textContent = '▶ Start Session';
+      qs('sessionStartBtn').disabled = false;
+      qs('sessionSaveBtn').style.display = '';
+    } else {
+      qs('autoSessStatus').textContent = '❌ '+(d.message||'Failed to start');
+      qs('autoSessStatus').className = 'status-txt fail';
+      toast(d.message||'Failed','err');
+    }
+  } catch(e){
+    qs('autoSessStatus').textContent = '❌ Server error';
+    qs('autoSessStatus').className = 'status-txt fail';
+  }
 }
+
+function _startPolling(sessionId){
+  if(_autoSessPoll) clearInterval(_autoSessPoll);
+  _autoSessPoll = setInterval(()=>_pollSession(sessionId), 8000);
+  _pollSession(sessionId);
+}
+
+async function _pollSession(sessionId){
+  try{
+    const d = await api(`/faculty/session_status?id=${encodeURIComponent(sessionId)}`);
+    if(!d.active && d.status !== 'completed') return;
+
+    qs('asCaptures').textContent = d.captures ?? '—';
+    qs('asPresent').textContent  = d.total ? `${d.present}/${d.total}` : '—';
+    qs('asMinsLeft').textContent = d.mins_left ?? '—';
+
+    // progress bar based on time consumed
+    if(S.currentSession && S.currentSession.slot_start && S.currentSession.slot_end){
+      const [sh,sm] = S.currentSession.slot_start.split(':').map(Number);
+      const [eh,em] = S.currentSession.slot_end.split(':').map(Number);
+      const totalMins = (eh*60+em)-(sh*60+sm);
+      const elapsed   = totalMins - (d.mins_left||0);
+      const pct = Math.min(100, Math.max(0, Math.round(elapsed/totalMins*100)));
+      qs('asProgressBar').style.width = pct+'%';
+    }
+
+    // detection preview
+    if(d.detected_preview && d.detected_preview.length){
+      qs('asDetectedList').style.display = '';
+      qs('asDetectedRows').innerHTML = d.detected_preview.map(p=>`
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 12px;border-bottom:1px solid var(--grey3);font-size:13px">
+          <span>${p.name}</span>
+          <span class="badge ${p.count>=2?'badge-green':'badge-orange'}">${p.count} detect${p.count!==1?'s':''} ${p.count>=2?'✓':''}</span>
+        </div>`).join('');
+    }
+
+    if(d.status === 'completed'){
+      clearInterval(_autoSessPoll); _autoSessPoll = null;
+      window._autoSessRunningId = null;
+      qs('asStatusLabel').textContent = '✅ Attendance finalised';
+      qs('autoSessStatus').textContent = `✅ Done — ${d.present}/${d.total} students marked present`;
+      qs('autoSessStatus').className = 'status-txt ok';
+      qs('sessionStartBtn').textContent = '✅ Auto-Done';
+      qs('sessionStartBtn').disabled = false;
+      // Keep Save button visible so faculty can review and override if needed
+      qs('sessionSaveBtn').style.display = '';
+      qs('sessionSaveBtn').textContent = '💾 Save / Override Attendance';
+      toast('Auto-attendance saved ✓ — review and save manually if needed','ok');
+      loadCalendar();
+      // Refresh student list from server (source of truth after auto-session)
+      if(S.currentSession){
+        const fresh = await api(`/faculty/session_detail?id=${S.currentSession.id}`);
+        S.currentSessionStudents = fresh.students;
+        renderSessionStudents(fresh.students);
+      }
+    } else {
+      qs('asStatusLabel').textContent = `🔄 Capturing… next in ~10 min`;
+    }
+  } catch(e){}
+}
+
+function closeAutoSessModal(){
+  qs('cameraModal').classList.add('hidden');
+  // keep polling in background if still running
+}
+
+// Keep backward-compat stubs (nothing calls these now, but just in case)
+function closeCameraModal(){ closeAutoSessModal(); }
 
 /* ═══════════════════════════════ DEPT PORTAL ════════════════════════════════ */
 async function initDeptPortal(){
-  S.deptSections=DEPT_SECS[S.dept]||[];
+  // Always populate deptSections immediately from the static map so dropdowns work
+  // even before the async faculty/timetable loads complete
+  S.deptSections = DEPT_SECS[S.dept] || [];
   ['anaSection','sessSection','searchSection','stuUploadSection','stuViewSection','manualStuSection'].forEach(id=>{
     const el=qs(id);if(!el)return;
     const hasAll=id==='sessSection'||id==='searchSection';
@@ -916,7 +1054,8 @@ async function initDeptPortal(){
   });
 
   qs('anaDate').value=todayISO();
-  qs('sessDate').value=todayISO();
+  // Do NOT pre-set sessDate — sessions tab uses week view by default
+  qs('sessDate').value='';
   qs('deptStatName').textContent=S.dept+' Department';
   qs('deptStatSec').textContent=S.deptSections.length;
 
@@ -929,6 +1068,7 @@ function switchDeptTab(id,el){
   el.classList.add('active');qs('dtab-'+id).classList.add('active');
   if(id==='timetable')loadTimetableInit();
   if(id==='analytics'){loadAnalytics();}
+  if(id==='sessions'){loadSessions();}
 }
 
 /* Faculty management */
@@ -1086,7 +1226,11 @@ async function saveTimetable(){
     entries[sid][field]=el.value;
   });
   const d=await api('/dept/save_timetable','POST',{faculty_username:fac,day,entries});
-  if(d.success)toast('Timetable saved & sessions generated ✓','ok');
+  if(d.success){
+    toast('Timetable saved & sessions generated ✓ — faculty calendar updated','ok');
+    // Reload timetable view to confirm persisted data
+    loadTimetable();
+  }
   else toast(d.error||'Error','err');
 }
 
@@ -1126,12 +1270,21 @@ async function loadTtWeekView(){
 }
 
 /* ── Sessions ── */
+let sessWeekOffset = 0;
+
 async function loadSessions(){
   const sec=qs('sessSection').value;const date=qs('sessDate').value;
+  // Update week label
+  const today=new Date();
+  const dow=today.getDay()||7;
+  const monday=new Date(today);monday.setDate(today.getDate()-dow+1+sessWeekOffset*7);
+  const sunday=new Date(monday);sunday.setDate(monday.getDate()+6);
+  const lbl=qs('sessWeekLabel');
+  if(lbl) lbl.textContent=monday.toLocaleDateString('en-IN',{day:'2-digit',month:'short'})+' – '+sunday.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});
   try{
-    const d=await api(`/dept/sessions?dept=${S.dept}&section=${encodeURIComponent(sec)}&date=${date}`);
+    const d=await api(`/dept/sessions?dept=${S.dept}&section=${encodeURIComponent(sec)}&date=${date}&week=${sessWeekOffset}`);
     const sessions=d.sessions||[];
-    if(!sessions.length){qs('sessGrid').innerHTML='<div style="color:var(--text2);text-align:center;padding:30px">No sessions found</div>';return;}
+    if(!sessions.length){qs('sessGrid').innerHTML='<div style="color:var(--text2);text-align:center;padding:30px">No sessions found for this week</div>';return;}
 
     const byDate={};
     sessions.forEach(s=>{byDate[s.date]=(byDate[s.date]||[]);byDate[s.date].push(s);});
@@ -1145,17 +1298,22 @@ async function loadSessions(){
         </div>
         <div class="card-body" style="padding:0">
           <table class="tbl"><thead><tr><th>Period</th><th>Section</th><th>Subject</th><th>Faculty</th><th>Attendance</th><th>Actions</th></tr></thead><tbody>
-          ${arr.map(s=>`<tr>
-            <td><strong>${s.slot_label}</strong><br><span style="font-size:11px;color:var(--text2)">${s.slot_start}–${s.slot_end}</span></td>
-            <td>${s.section}</td>
-            <td>${s.subject||'—'}</td>
-            <td style="font-size:12px">${s.faculty_name||db_faculty_name(s.faculty_username)}${s.substitute?`<br><span style="color:var(--amber);font-size:11px">📌 Sub: ${s.substitute_name||db_faculty_name(s.substitute)}</span>`:''}</td>
-            <td><span class="badge ${s.att_count>0?'badge-green':'badge-grey'}">${s.att_count||0}/${s.total_students||0}</span></td>
-            <td><div style="display:flex;gap:6px">
-              <button class="btn btn-ghost btn-xs" onclick="openDeptAttModal('${s.section}','${s.slot_id}','${s.date}')">📋 Edit Att</button>
-              <button class="btn btn-ghost btn-xs" onclick="openSubModal('${s.id}','${s.subject}','${s.section}','${s.date}')">📌 Sub</button>
-            </div></td>
-          </tr>`).join('')}
+          ${arr.map(s=>{
+            const attBadge = s.att_marked ? 'badge-green' : (s.att_count > 0 ? 'badge-orange' : 'badge-grey');
+            const attLabel = (s.att_marked ? '\u2713 ' : '') + (s.att_count||0) + '/' + (s.total_students||0);
+            const subInfo = JSON.stringify({id:s.id,subj:s.subject||'',sec:s.section,date:s.date});
+            return `<tr>
+              <td><strong>${s.slot_label}</strong><br><span style="font-size:11px;color:var(--text2)">${s.slot_start}\u2013${s.slot_end}</span></td>
+              <td>${s.section}</td>
+              <td>${s.subject||'\u2014'}</td>
+              <td style="font-size:12px">${s.faculty_name||db_faculty_name(s.faculty_username)}${s.substitute?`<br><span style="color:var(--amber);font-size:11px">\ud83d\udccc Sub: ${s.substitute_name||db_faculty_name(s.substitute)}</span>`:''}</td>
+              <td><span class="badge ${attBadge}">${attLabel}</span></td>
+              <td><div style="display:flex;gap:6px">
+                <button class="btn btn-ghost btn-xs" onclick="openDeptAttModal('${s.section}','${s.slot_id}','${s.date}')">\ud83d\udccb Edit Att</button>
+                <button class="btn btn-ghost btn-xs" onclick='openSubModal(${JSON.stringify(s.id)},${JSON.stringify(s.subject||"")},${JSON.stringify(s.section)},${JSON.stringify(s.date)})'>\ud83d\udccc Sub</button>
+              </div></td>
+            </tr>`;
+          }).join('')}
           </tbody></table>
         </div>
       </div>
@@ -1179,7 +1337,12 @@ async function saveSubstitute(){
   const sessId=qs('subSessionId').value;const sub=qs('subFacultySelect').value;
   if(!sub){toast('Select a faculty','err');return;}
   const d=await api('/dept/assign_substitute','POST',{session_id:sessId,substitute:sub});
-  if(d.success){toast('Substitute assigned ✓','ok');qs('subModal').classList.add('hidden');loadSessions();}
+  if(d.success){
+    const subName=S.deptFaculty.find(f=>f.username===sub)?.name||sub;
+    toast(`✅ ${subName} assigned as substitute — their calendar is now updated`,'ok');
+    qs('subModal').classList.add('hidden');
+    loadSessions();
+  }
   else toast(d.error||'Error','err');
 }
 
@@ -1219,9 +1382,11 @@ async function loadAnalytics(){
 }
 
 function openAnaAttModal(){
-  if(anaCurrentSection&&anaCurrentDate){
-    const firstSlot=document.querySelector('.sac-detail');if(firstSlot)firstSlot.click();
-  }
+  // Open the first period's attendance modal from the current analytics view
+  if(!anaCurrentSection || !anaCurrentDate){toast('Select a section and date first','err');return;}
+  // Find first non-break slot and open it
+  const firstSlotId = 'slot1';
+  openDeptAttModal(anaCurrentSection, firstSlotId, anaCurrentDate);
 }
 
 let deptAttCurrentKey={sec:'',slot:'',date:''};
@@ -1377,8 +1542,14 @@ function downloadSearchResults(){
 
 /* ── Download attendance ── */
 function openDownloadAttModal(){
+  // For admin role, S.dept may be null — provide all sections across all depts
+  let sections = S.deptSections.length ? S.deptSections : (DEPT_SECS[S.dept]||[]);
+  if(!sections.length){
+    // Admin: show all sections from all departments
+    sections = Object.values(DEPT_SECS).flat();
+  }
   const sel=qs('dlSection');
-  sel.innerHTML='<option value="">Select…</option>'+S.deptSections.map(s=>`<option value="${s}">${s}</option>`).join('');
+  sel.innerHTML='<option value="">Select…</option>'+sections.map(s=>`<option value="${s}">${s}</option>`).join('');
   qs('dlDate').value=todayISO();
   qs('downloadModal').classList.remove('hidden');
 }
