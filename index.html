@@ -875,11 +875,13 @@ async function openSessionModal(sessionId){
     const startBtn = qs('sessionStartBtn');
     const isRunning = window._autoSessRunningId === sess.id;
     if(isRunning){
-      startBtn.textContent = '⏹ Session Running';
-      startBtn.disabled = true;
+      startBtn.textContent = '⏹ Stop Session';
+      startBtn.disabled = false;
+      startBtn.onclick = stopAutoSession;
     } else {
       startBtn.textContent = '▶ Start Session';
       startBtn.disabled = false;
+      startBtn.onclick = startAutoSession;
     }
     qs('sessionModal').classList.remove('hidden');
   }catch(e){toast('Could not load session','err');}
@@ -952,8 +954,9 @@ async function startAutoSession(){
         : `✅ Session started — auto-capturing until ${d.finalize_at}`;
       qs('autoSessStatus').className = 'status-txt ok';
       window._autoSessRunningId = sess.id;
-      qs('sessionStartBtn').textContent = '⏹ Session Running';
-      qs('sessionStartBtn').disabled = true;
+      qs('sessionStartBtn').textContent = '⏹ Stop Session';
+      qs('sessionStartBtn').disabled = false;
+      qs('sessionStartBtn').onclick = stopAutoSession;
       _startPolling(sess.id);
     } else if(d.period_ended){
       // Period ended — close camera modal, let faculty mark manually
@@ -971,6 +974,14 @@ async function startAutoSession(){
     qs('autoSessStatus').textContent = '❌ Server error';
     qs('autoSessStatus').className = 'status-txt fail';
   }
+}
+
+async function stopAutoSession() {
+  if(!window._autoSessRunningId) return;
+  qs('sessionStartBtn').textContent = 'Stopping...';
+  qs('sessionStartBtn').disabled = true;
+  await api('/faculty/stop_session', 'POST', {session_id: window._autoSessRunningId});
+  // Next poll will see status='completed' and finish up
 }
 
 function _startPolling(sessionId){
@@ -996,6 +1007,19 @@ async function _pollSession(sessionId){
       const elapsed   = totalMins - (d.mins_left||0);
       const pct = Math.min(100, Math.max(0, Math.round(elapsed/totalMins*100)));
       qs('asProgressBar').style.width = pct+'%';
+    }
+
+    // update background modal students live
+    if(d.detected_counts && S.currentSessionStudents){
+      let updated = false;
+      S.currentSessionStudents.forEach(stu => {
+        const cnt = d.detected_counts[stu.name] || 0;
+        if(cnt >= 2 && stu.status !== 'Present') {
+          stu.status = 'Present';
+          updated = true;
+        }
+      });
+      if(updated) renderSessionStudents(S.currentSessionStudents);
     }
 
     // detection preview
