@@ -1,0 +1,11 @@
+{
+  "debug": true,
+  "log_level": "DEBUG",
+  "performance_monitoring": true,
+  "model_precision": "fp32",
+  "camera_resolution": [
+    640,
+    480
+  ],
+  "frame_rate": 30
+}
