@@ -700,6 +700,9 @@ def faculty_start_session():
     # parse slot end time to build end datetime
     slot_end_str = sess.get("slot_end", "")
     sess_date    = sess.get("date", datetime.date.today().isoformat())
+    
+    if sess_date != datetime.date.today().isoformat():
+        return jsonify({"success": False, "message": "Attendance can only be captured on the exact day of the session"}), 403
     try:
         h, m = map(int, slot_end_str.split(":"))
         date_obj  = datetime.date.fromisoformat(sess_date)
@@ -785,8 +788,22 @@ def faculty_session_status():
         "detected_preview": [
             {"name": name, "count": cnt}
             for name, cnt in sorted(info["detected_counts"].items(), key=lambda x: -x[1])
-        ][:10],
+        ],
+        "detected_counts": info["detected_counts"],
     })
+
+@app.route("/faculty/stop_session", methods=["POST"])
+def faculty_stop_session():
+    u = me()
+    if not u:
+        return jsonify({"success": False}), 401
+    session_id = request.json.get("session_id")
+    with _session_lock:
+        info = active_sessions.get(session_id)
+        if info and info["status"] in ("running", "finalizing"):
+            info["stop_event"].set()
+            return jsonify({"success": True})
+    return jsonify({"success": False, "message": "Not running"})
 
 @app.route("/faculty/save_attendance", methods=["POST"])
 def faculty_save_attendance():
@@ -802,6 +819,9 @@ def faculty_save_attendance():
 
     if not section or not slot_id:
         return jsonify({"success": False, "error": "section and slot_id required"}), 400
+
+    if date_str != datetime.date.today().isoformat():
+        return jsonify({"success": False, "error": "Attendance can only be marked on the exact day of the session"}), 403
 
     # Normalise records: ensure each has roll, name, status
     clean_records = []
@@ -1513,6 +1533,9 @@ def dept_update_attendance():
 
     try:
         att_date = datetime.date.fromisoformat(date_str)
+        if att_date > datetime.date.today():
+            return jsonify({"error": "Cannot modify attendance for future dates"}), 400
+
         cutoff   = datetime.datetime.combine(att_date + datetime.timedelta(days=1),
                                               datetime.time(18, 0))
         if datetime.datetime.now() > cutoff:
@@ -1876,3 +1899,4 @@ if __name__ == "__main__":
     print("\n🌐  http://localhost:8080")
     print("🔑  Default admin login: admin / admin123\n")
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
+    
